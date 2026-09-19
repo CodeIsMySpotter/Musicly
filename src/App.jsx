@@ -24,11 +24,16 @@ export default function App() {
   // 1.7 FIX: isPlaying now lives in Zustand store
   const isPlaying = useStore(state => state.isPlaying);
   const setIsPlaying = useStore(state => state.setIsPlaying);
-  const selectedClipId = useStore(state => state.selectedClipId);
-  const setSelectedClipId = useStore(state => state.setSelectedClipId);
+  const selectedClipIds = useStore(state => state.selectedClipIds);
+  const setSelectedClipIds = useStore(state => state.setSelectedClipIds);
+  const clearSelection = useStore(state => state.clearSelection);
   const loadProject = useStore(state => state.loadProject);
   const setActiveTool = useStore(state => state.setActiveTool);
-  const removeClip = useStore(state => state.removeClip);
+  const removeSelectedClips = useStore(state => state.removeSelectedClips);
+  const copySelectedClips = useStore(state => state.copySelectedClips);
+  const pasteClips = useStore(state => state.pasteClips);
+  const toasts = useStore(state => state.toasts);
+  const addToast = useStore(state => state.addToast);
 
   const [isExporting, setIsExporting] = useState(false);
   const [masterVolume, setMasterVolume] = useState(90); // 0-100 range for UI
@@ -53,12 +58,21 @@ export default function App() {
       if (e.code === 'Space') {
         e.preventDefault();
         handlePlayToggle();
-      } else if (e.key === 'v' && !e.ctrlKey) {
+      } else if (e.key === 'v' && !e.ctrlKey && !e.metaKey) {
         setActiveTool('move');
-      } else if ((e.key === 'd' || e.key === 'b') && !e.ctrlKey) {
+      } else if ((e.key === 'd' || e.key === 'b') && !e.ctrlKey && !e.metaKey) {
         setActiveTool('draw');
-      } else if (e.key === 'e' && !e.ctrlKey) {
+      } else if (e.key === 'e' && !e.ctrlKey && !e.metaKey) {
         setActiveTool('erase');
+      } else if (e.key === 'c' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        copySelectedClips();
+        addToast('Copied to clipboard');
+      } else if (e.key === 'v' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        const currentBeat = engine.getPlayheadPosition(80) / 80;
+        pasteClips(currentBeat);
+        addToast('Pasted clips');
       } else if (e.key === 'z' && e.ctrlKey && !e.shiftKey) {
         e.preventDefault();
         undo();
@@ -66,18 +80,16 @@ export default function App() {
         e.preventDefault();
         redo();
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectedClipId && !e.target.closest('input')) {
-          removeClip(selectedClipId);
-        }
+        removeSelectedClips();
       } else if (e.key === 'Escape') {
-        setSelectedClipId(null);
+        clearSelection();
       } else if (e.key === 'Home') {
         handleReplay();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedClipId, isPlaying]);
+  }, [selectedClipIds, isPlaying]);
 
   const handlePlayToggle = useCallback(async () => {
     if (!engine.isInitialized) {
@@ -104,6 +116,7 @@ export default function App() {
     a.download = 'musicly_subnautica.json';
     a.click();
     URL.revokeObjectURL(url);
+    addToast('Project saved ✓');
   };
 
   const handleLoad = (e) => {
@@ -114,29 +127,31 @@ export default function App() {
       try {
         const data = JSON.parse(ev.target.result);
         loadProject(data);
+        addToast('Project loaded ✓');
       } catch (error) {
-        alert('Invalid project file');
+        addToast('Invalid project file', 'error');
       }
     };
     reader.readAsText(file);
   };
 
   const handleExport = async () => {
-    if (!engine.isInitialized) {
-      await engine.init();
-    }
-    if (isExporting) {
-      const url = await engine.stopRecording();
+    if (isExporting) return;
+    setIsExporting(true);
+    addToast('Rendering WAV...', 'info');
+    try {
+      const url = await engine.exportWav(useStore.getState().tracks, useStore.getState().clips, useStore.getState().bpm);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'musicly_bounce.webm';
+      a.download = 'musicly_bounce.wav';
       a.click();
+      URL.revokeObjectURL(url);
+      addToast('Export complete ✓');
+    } catch (err) {
+      console.error(err);
+      addToast('Export failed', 'error');
+    } finally {
       setIsExporting(false);
-      setIsPlaying(false);
-    } else {
-      setIsExporting(true);
-      setIsPlaying(true);
-      engine.startRecording();
     }
   };
 
@@ -150,7 +165,7 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen text-white bg-subnautica-deep overflow-hidden font-sans relative">
+    <div className="h-screen w-screen flex flex-col bg-subnautica-base text-white overflow-hidden font-sans selection:bg-subnautica-active/30">
       {/* 4.1: Animated ocean bubbles background */}
       <div className="ocean-bubbles" aria-hidden="true">
         {Array.from({ length: 15 }).map((_, i) => (
@@ -216,12 +231,21 @@ export default function App() {
       </div>
 
       {/* Piano Roll Modal with animation (4.4) */}
-      {selectedClipId && (
-        <PianoRoll instruments={INSTRUMENTS} />
+      {selectedClipIds.length > 0 && (
+        <PianoRoll clipId={selectedClipIds[0]} instruments={INSTRUMENTS} />
       )}
 
       {/* Confirm Modal (rendered globally, controlled by store) */}
       <ConfirmModal />
+
+      {/* 4.5: Toast Notifications */}
+      <div className="fixed bottom-4 right-4 z-[200] flex flex-col gap-2 pointer-events-none">
+        {toasts.map((toast) => (
+          <div key={toast.id} className="bg-subnautica-panel border border-subnautica-active/50 rounded shadow-lg px-4 py-2 text-[11px] font-semibold text-white/90 backdrop-blur-md transition-all duration-300 transform translate-y-0 opacity-100">
+            {toast.message}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -92,11 +92,11 @@ class AudioEngine {
 
     // 1.4 FIX: Subscribe ONLY to tracks, clips, bpm changes using subscribeWithSelector
     useStore.subscribe(
-      (state) => ({ tracks: state.tracks, clips: state.clips, bpm: state.bpm }),
-      ({ tracks, clips, bpm }) => {
-        this.sync(tracks, clips, bpm);
+      (state) => ({ tracks: state.tracks, clips: state.clips, bpm: state.bpm, loopRegion: state.loopRegion }),
+      ({ tracks, clips, bpm, loopRegion }) => {
+        this.sync(tracks, clips, bpm, loopRegion);
       },
-      { equalityFn: (a, b) => a.tracks === b.tracks && a.clips === b.clips && a.bpm === b.bpm }
+      { equalityFn: (a, b) => a.tracks === b.tracks && a.clips === b.clips && a.bpm === b.bpm && a.loopRegion === b.loopRegion }
     );
 
     // Subscribe to metronome toggle
@@ -110,12 +110,17 @@ class AudioEngine {
     this.sync(s.tracks, s.clips, s.bpm);
   }
 
-  sync(tracks, clips, bpm) {
+  sync(tracks, clips, bpm, loopRegion) {
     if (!this.isInitialized) return;
 
     if (this.lastBpm !== bpm) {
       Tone.Transport.bpm.value = bpm;
       this.lastBpm = bpm;
+    }
+    
+    if (loopRegion) {
+      Tone.Transport.loopStart = loopRegion.start * Tone.Time("4n").toSeconds();
+      Tone.Transport.loopEnd = Math.max(loopRegion.start + 0.25, loopRegion.end) * Tone.Time("4n").toSeconds();
     }
 
     // 1. Reconcile per-track channel strips (create/update/remove)
@@ -182,7 +187,8 @@ class AudioEngine {
           trackId: track.id,
           instId: track.inst,
           note: noteEvent.note,
-          duration: noteDurationBeat * Tone.Time("4n").toSeconds()
+          duration: noteDurationBeat * Tone.Time("4n").toSeconds(),
+          velocity: noteEvent.velocity !== undefined ? noteEvent.velocity : 0.8
         });
       });
     });
@@ -193,9 +199,9 @@ class AudioEngine {
 
       try {
         if (value.instId === 'snare' || value.instId === 'hat') {
-          strip.synth.triggerAttackRelease(value.duration, time);
+          strip.synth.triggerAttackRelease(value.duration, time, value.velocity);
         } else {
-          strip.synth.triggerAttackRelease(value.note, value.duration, time);
+          strip.synth.triggerAttackRelease(value.note, value.duration, time, value.velocity);
         }
       } catch (err) {
         console.error("Error playing synth:", value.instId, err);
@@ -215,11 +221,12 @@ class AudioEngine {
       for (let i = 0; i < 256; i++) {
         events.push({
           time: i * Tone.Time("4n").toSeconds(),
-          note: i % 4 === 0 ? 'G5' : 'C5'
+          note: i % 4 === 0 ? 'G5' : 'C5',
+          isDownbeat: i % 4 === 0
         });
       }
       this.metronomePart = new Tone.Part((time, value) => {
-        this.metronomeSynth.triggerAttackRelease(value.note, "32n", time, i % 4 === 0 ? 0.5 : 0.25);
+        this.metronomeSynth.triggerAttackRelease(value.note, "32n", time, value.isDownbeat ? 0.5 : 0.25);
       }, events).start(0);
     }
   }
@@ -240,23 +247,176 @@ class AudioEngine {
     }
   }
 
-  startRecording() {
-    this.recorder = new Tone.Recorder();
-    this.effects.masterGain.connect(this.recorder);
-    this.recorder.start();
+  startIsolatedPlayback(clipId, trackId) {
+    if (!this.isInitialized) return;
+    
+    // 1. Mute all tracks except the one being edited
+    Object.keys(this.trackStrips).forEach(tid => {
+      this.trackStrips[tid].channel.mute = (tid !== trackId);
+    });
+
+    // 2. Set loop to clip boundaries
+    const clip = useStore.getState().clips.find(c => c.id === clipId);
+    if (clip) {
+      this.originalLoopStart = Tone.Transport.loopStart;
+      this.originalLoopEnd = Tone.Transport.loopEnd;
+      this.originalLoop = Tone.Transport.loop;
+      
+      const startSec = (clip.x / BEAT_WIDTH) * Tone.Time("4n").toSeconds();
+      const endSec = ((clip.x + clip.width) / BEAT_WIDTH) * Tone.Time("4n").toSeconds();
+      
+      Tone.Transport.loopStart = startSec;
+      Tone.Transport.loopEnd = endSec;
+      Tone.Transport.loop = true;
+      Tone.Transport.seconds = startSec;
+    }
+    
+    this.effects.masterGain.gain.rampTo(0.9, 0.05);
     Tone.Transport.start();
   }
 
-  async stopRecording() {
+  stopIsolatedPlayback() {
+    if (!this.isInitialized) return;
     Tone.Transport.pause();
-    if (this.recorder) {
-      const recording = await this.recorder.stop();
-      this.effects.masterGain.disconnect(this.recorder);
-      this.recorder.dispose();
-      this.recorder = null;
-      return URL.createObjectURL(recording);
+    this.effects.masterGain.gain.rampTo(0, 0.05);
+    
+    // Release synths
+    Object.values(this.trackStrips).forEach(strip => {
+      const synth = strip.synth;
+      if (synth.releaseAll) synth.releaseAll();
+      else if (synth.triggerRelease) synth.triggerRelease(Tone.now());
+    });
+    
+    // Restore loop
+    if (this.originalLoopStart !== undefined) {
+      Tone.Transport.loopStart = this.originalLoopStart;
+      Tone.Transport.loopEnd = this.originalLoopEnd;
+      Tone.Transport.loop = this.originalLoop;
     }
-    return null;
+    
+    // Restore mutes from store
+    const tracks = useStore.getState().tracks;
+    const anySolo = tracks.some(t => t.solo);
+    tracks.forEach(t => {
+      if (this.trackStrips[t.id]) {
+        this.trackStrips[t.id].channel.mute = t.mute || (anySolo && !t.solo);
+      }
+    });
+  }
+
+  async exportWav(tracks, clips, bpm) {
+    // Determine max duration
+    const beatTime = 60 / bpm;
+    let maxSeconds = 0;
+    clips.forEach(clip => {
+      const endBeat = (clip.x + clip.width) / BEAT_WIDTH;
+      const endSec = endBeat * beatTime;
+      if (endSec > maxSeconds) maxSeconds = endSec;
+    });
+    maxSeconds += 2; // reverb tail
+
+    const buffer = await Tone.Offline(({ transport }) => {
+      transport.bpm.value = bpm;
+
+      // Create effects
+      const masterGain = new Tone.Gain(0.9).toDestination();
+      const masterDelay = new Tone.FeedbackDelay({ delayTime: "8n", feedback: 0.3, wet: 0.2 }).connect(masterGain);
+      const masterReverb = new Tone.Reverb({ decay: 6.0, wet: 0.4 }).connect(masterDelay);
+      const masterFilter = new Tone.Filter({ frequency: 2800, type: "lowpass", rolloff: -24 }).connect(masterReverb);
+
+      // Create tracks
+      const strips = {};
+      tracks.forEach(track => {
+        const channel = new Tone.Channel().connect(masterFilter);
+        const synth = createSynth(track.inst);
+        synth.connect(channel);
+        channel.volume.value = track.volume;
+        channel.pan.value = track.pan;
+        channel.mute = track.mute;
+        strips[track.id] = { channel, synth, instId: track.inst };
+      });
+
+      // Schedule events
+      const events = [];
+      clips.forEach(clip => {
+        const track = tracks.find(t => t.id === clip.trackId);
+        if (!track) return;
+        const clipStartBeat = clip.x / BEAT_WIDTH;
+        (clip.notes || []).forEach(noteEvent => {
+          const noteStartBeat = clipStartBeat + (noteEvent.time / BEAT_WIDTH);
+          const noteDurationBeat = noteEvent.duration / BEAT_WIDTH;
+          events.push({
+            time: noteStartBeat * beatTime,
+            trackId: track.id,
+            instId: track.inst,
+            note: noteEvent.note,
+            duration: noteDurationBeat * beatTime,
+            velocity: noteEvent.velocity !== undefined ? noteEvent.velocity : 0.8
+          });
+        });
+      });
+
+      new Tone.Part((time, value) => {
+        const strip = strips[value.trackId];
+        if (!strip) return;
+        if (value.instId === 'snare' || value.instId === 'hat') {
+          strip.synth.triggerAttackRelease(value.duration, time, value.velocity);
+        } else {
+          strip.synth.triggerAttackRelease(value.note, value.duration, time, value.velocity);
+        }
+      }, events).start(0);
+
+      transport.start();
+    }, maxSeconds);
+
+    return this.audioBufferToWavUrl(buffer.get());
+  }
+
+  // AudioBuffer to WAV Blob URL helper
+  audioBufferToWavUrl(buffer) {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = 1; // PCM
+    const bitDepth = 16;
+    
+    const result = new Float32Array(buffer.length * numChannels);
+    for (let channel = 0; channel < numChannels; channel++) {
+      const channelData = buffer.getChannelData(channel);
+      for (let i = 0; i < buffer.length; i++) {
+        result[i * numChannels + channel] = channelData[i];
+      }
+    }
+
+    const dataLength = result.length * (bitDepth / 8);
+    const bufferArray = new ArrayBuffer(44 + dataLength);
+    const view = new DataView(bufferArray);
+
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataLength, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true); // fmt chunk size
+    view.setUint16(20, format, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+    view.setUint16(32, numChannels * (bitDepth / 8), true);
+    view.setUint16(34, bitDepth, true);
+    writeString(36, 'data');
+    view.setUint32(40, dataLength, true);
+
+    let offset = 44;
+    for (let i = 0; i < result.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, result[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+
+    const blob = new Blob([view], { type: 'audio/wav' });
+    return URL.createObjectURL(blob);
   }
 
   getPlayheadPosition(beatWidth = 80) {
@@ -286,8 +446,10 @@ class AudioEngine {
   }
 
   // Preview a note (for Piano Roll auditioning) — uses a separate preview synth
-  playNote(instrument, note, duration = "8n") {
-    if (!this.isInitialized) return;
+  async playNote(instrument, note, duration = "8n", velocity = 0.8) {
+    if (!this.isInitialized) {
+      await this.init();
+    }
     // Lazy-create preview synths so they don't interfere with track synths
     if (!this.previewSynths[instrument]) {
       this.previewSynths[instrument] = createSynth(instrument);
@@ -296,9 +458,9 @@ class AudioEngine {
     const synth = this.previewSynths[instrument];
     try {
       if (instrument === 'snare' || instrument === 'hat') {
-        synth.triggerAttackRelease(duration);
+        synth.triggerAttackRelease(duration, Tone.now(), velocity);
       } else {
-        synth.triggerAttackRelease(note, duration);
+        synth.triggerAttackRelease(note, duration, Tone.now(), velocity);
       }
     } catch (err) {
       console.error("Error playing preview:", instrument, err);

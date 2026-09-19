@@ -8,12 +8,14 @@ export const useStore = create(
       (set, get) => ({
         // --- Project Settings ---
         bpm: 80,
-        gridSnap: 20, // pixels — 1/4 beat (BEAT_WIDTH=80)
+        gridSnap: 0.25, // multiplier of BEAT_WIDTH (e.g. 0.25 = 1/4 beat)
         zoom: 1, // multiplier (0.25 – 4)
 
         // --- Transport ---
         isPlaying: false,
         setIsPlaying: (isPlaying) => set({ isPlaying }),
+        loopRegion: { start: 0, end: 16 }, // in beats
+        setLoopRegion: (start, end) => set({ loopRegion: { start, end } }),
 
         // --- Tracks ---
         tracks: [
@@ -36,12 +38,20 @@ export const useStore = create(
 
         // --- UI State ---
         activeTool: 'move', // move, draw, erase
-        selectedClipId: null,
-        
-        // --- Confirm Modal ---
+        selectedClipIds: [],
+        clipboard: [],
         confirmModal: null, // { title, message, onConfirm }
         showConfirmModal: (title, message, onConfirm) => set({ confirmModal: { title, message, onConfirm } }),
         hideConfirmModal: () => set({ confirmModal: null }),
+
+        // --- Toasts ---
+        toasts: [],
+        addToast: (message, type = 'success') => {
+          const id = Date.now();
+          set((state) => ({ toasts: [...state.toasts, { id, message, type }] }));
+          setTimeout(() => get().removeToast(id), 3000);
+        },
+        removeToast: (id) => set((state) => ({ toasts: state.toasts.filter(t => t.id !== id) })),
 
         // --- Context Menu ---
         contextMenu: null, // { x, y, clipId }
@@ -53,7 +63,17 @@ export const useStore = create(
         setGridSnap: (gridSnap) => set({ gridSnap }),
         setZoom: (zoom) => set({ zoom: Math.max(0.25, Math.min(4, zoom)) }),
         setActiveTool: (activeTool) => set({ activeTool }),
-        setSelectedClipId: (selectedClipId) => set({ selectedClipId }),
+        
+        setSelectedClipIds: (id, append = false) => set((state) => {
+          if (append) {
+            if (state.selectedClipIds.includes(id)) {
+              return { selectedClipIds: state.selectedClipIds.filter(x => x !== id) };
+            }
+            return { selectedClipIds: [...state.selectedClipIds, id] };
+          }
+          return { selectedClipIds: id ? [id] : [] };
+        }),
+        clearSelection: () => set({ selectedClipIds: [] }),
 
         // Tracks Actions
         addTrack: () => set((state) => ({
@@ -71,6 +91,17 @@ export const useStore = create(
           tracks: state.tracks.filter(t => t.id !== id),
           clips: state.clips.filter(c => c.trackId !== id)
         })),
+        moveTrack: (id, direction) => set((state) => {
+          const index = state.tracks.findIndex(t => t.id === id);
+          if (index < 0) return {};
+          if (direction === -1 && index === 0) return {};
+          if (direction === 1 && index === state.tracks.length - 1) return {};
+          const newTracks = [...state.tracks];
+          const temp = newTracks[index];
+          newTracks[index] = newTracks[index + direction];
+          newTracks[index + direction] = temp;
+          return { tracks: newTracks };
+        }),
 
         // Clips Actions
         addClip: (clip) => set((state) => ({
@@ -81,8 +112,13 @@ export const useStore = create(
         })),
         removeClip: (id) => set((state) => ({
           clips: state.clips.filter(c => c.id !== id),
-          selectedClipId: state.selectedClipId === id ? null : state.selectedClipId
+          selectedClipIds: state.selectedClipIds.filter(x => x !== id)
         })),
+        removeSelectedClips: () => set((state) => ({
+          clips: state.clips.filter(c => !state.selectedClipIds.includes(c.id)),
+          selectedClipIds: []
+        })),
+        
         // 3.5: Duplicate a clip with deep-copied notes
         duplicateClip: (id) => set((state) => {
           const original = state.clips.find(c => c.id === id);
@@ -94,6 +130,35 @@ export const useStore = create(
             notes: (original.notes || []).map(n => ({ ...n, id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}` }))
           };
           return { clips: [...state.clips, newClip] };
+        }),
+
+        // 3.6: Clipboard operations
+        copySelectedClips: () => set((state) => {
+          const toCopy = state.clips.filter(c => state.selectedClipIds.includes(c.id));
+          if (toCopy.length === 0) return {};
+          // Sort by x position
+          toCopy.sort((a, b) => a.x - b.x);
+          return { clipboard: toCopy };
+        }),
+        pasteClips: (playheadBeat) => set((state) => {
+          if (!state.clipboard || state.clipboard.length === 0) return {};
+          
+          const BEAT_WIDTH = 80;
+          const playheadX = playheadBeat * BEAT_WIDTH;
+          const firstClipX = state.clipboard[0].x;
+          const offset = playheadX - firstClipX;
+          
+          const newClips = state.clipboard.map(c => ({
+            ...c,
+            id: Date.now() + Math.random(),
+            x: Math.max(0, c.x + offset),
+            notes: (c.notes || []).map(n => ({ ...n, id: Date.now() + Math.random() }))
+          }));
+          
+          return {
+            clips: [...state.clips, ...newClips],
+            selectedClipIds: newClips.map(c => c.id)
+          };
         }),
 
         // Notes Actions (inside clips)

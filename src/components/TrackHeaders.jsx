@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store/useStore';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2, ArrowUp, ArrowDown } from 'lucide-react';
 import { engine } from '../engine/AudioEngine';
 
 export default function TrackHeaders({ instruments }) {
@@ -8,6 +8,7 @@ export default function TrackHeaders({ instruments }) {
   const addTrack = useStore(state => state.addTrack);
   const updateTrack = useStore(state => state.updateTrack);
   const removeTrack = useStore(state => state.removeTrack);
+  const moveTrack = useStore(state => state.moveTrack);
   const showConfirmModal = useStore(state => state.showConfirmModal);
 
   // Helper to get instrument color
@@ -24,15 +25,28 @@ export default function TrackHeaders({ instruments }) {
       </div>
 
       {/* Track List */}
-      <div className="flex-1 overflow-y-auto">
-        {tracks.map((track) => (
+      <div 
+        id="track-headers-scroll" 
+        className="flex-1 overflow-y-auto"
+        onScroll={(e) => {
+          const timeline = document.getElementById('timeline-scroll');
+          if (timeline && timeline.scrollTop !== e.target.scrollTop) {
+            timeline.scrollTop = e.target.scrollTop;
+          }
+        }}
+      >
+        {tracks.map((track, i) => (
           <TrackRow
             key={track.id}
             track={track}
+            index={i}
+            isFirst={i === 0}
+            isLast={i === tracks.length - 1}
             instruments={instruments}
             instColor={getInstColor(track.inst)}
             updateTrack={updateTrack}
             removeTrack={removeTrack}
+            moveTrack={moveTrack}
             showConfirmModal={showConfirmModal}
           />
         ))}
@@ -42,8 +56,10 @@ export default function TrackHeaders({ instruments }) {
 }
 
 // Separate component for perf (React.memo candidate)
-function TrackRow({ track, instruments, instColor, updateTrack, removeTrack, showConfirmModal }) {
+function TrackRow({ track, index, isFirst, isLast, instruments, instColor, updateTrack, removeTrack, moveTrack, showConfirmModal }) {
   const [vuLevel, setVuLevel] = useState(0);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const nameInputRef = useRef(null);
   const isPlaying = useStore(state => state.isPlaying);
   const animRef = useRef(null);
 
@@ -84,11 +100,24 @@ function TrackRow({ track, instruments, instColor, updateTrack, removeTrack, sho
 
       {/* Track Info */}
       <div className="flex flex-col flex-1 min-w-0 px-1">
-        <input
-          value={track.name}
-          onChange={(e) => updateTrack(track.id, { name: e.target.value })}
-          className="bg-transparent text-[11px] font-semibold text-white outline-none w-full truncate"
-        />
+        {/* 3.8: Inline Rename */}
+        {isEditingName ? (
+          <input
+            ref={nameInputRef}
+            value={track.name}
+            onChange={(e) => updateTrack(track.id, { name: e.target.value })}
+            onBlur={() => setIsEditingName(false)}
+            onKeyDown={(e) => e.key === 'Enter' && setIsEditingName(false)}
+            className="bg-black/50 text-[11px] font-semibold text-white outline-none w-full px-1 border border-subnautica-active/30 rounded"
+          />
+        ) : (
+          <span 
+            onDoubleClick={() => { setIsEditingName(true); setTimeout(() => nameInputRef.current?.focus(), 0); }}
+            className="text-[11px] font-semibold text-white truncate cursor-text hover:bg-white/5 rounded px-1"
+          >
+            {track.name}
+          </span>
+        )}
         <div className="flex items-center gap-1">
           {/* 2.2: Color dot */}
           <div className="w-2 h-2 rounded-full shrink-0" style={{ background: instColor }} />
@@ -148,14 +177,34 @@ function TrackRow({ track, instruments, instColor, updateTrack, removeTrack, sho
         />
       </div>
 
-      {/* Delete (hover reveal) */}
-      <button
-        onClick={handleDelete}
-        className="absolute right-0.5 top-0.5 w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-rose-500/20 text-rose-400 rounded hover:bg-rose-500/40 transition-opacity"
-        title="Delete Track"
-      >
-        <Trash2 size={10} />
-      </button>
+      {/* Actions (hover reveal) */}
+      <div className="absolute right-0.5 top-0.5 flex flex-col gap-[1px] opacity-0 group-hover:opacity-100 transition-opacity">
+        <button
+          onClick={handleDelete}
+          className="w-4 h-4 flex items-center justify-center bg-rose-500/20 text-rose-400 rounded hover:bg-rose-500/40"
+          title="Delete Track"
+        >
+          <Trash2 size={10} />
+        </button>
+        <div className="flex gap-[1px]">
+          <button
+            onClick={() => moveTrack(track.id, -1)}
+            disabled={isFirst}
+            className={`w-4 h-4 flex items-center justify-center bg-white/5 text-white/60 rounded ${isFirst ? 'opacity-30 cursor-not-allowed' : 'hover:bg-white/20 hover:text-white'}`}
+            title="Move Up"
+          >
+            <ArrowUp size={10} />
+          </button>
+          <button
+            onClick={() => moveTrack(track.id, 1)}
+            disabled={isLast}
+            className={`w-4 h-4 flex items-center justify-center bg-white/5 text-white/60 rounded ${isLast ? 'opacity-30 cursor-not-allowed' : 'hover:bg-white/20 hover:text-white'}`}
+            title="Move Down"
+          >
+            <ArrowDown size={10} />
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { useStore } from '../store/useStore';
 import { Rnd } from 'react-rnd';
-import { X, Pencil, MousePointer2, Scissors } from 'lucide-react';
+import { X, Pencil, MousePointer2, Scissors, Play, Square } from 'lucide-react';
 import { engine } from '../engine/AudioEngine';
 
 // Full chromatic range across multiple octaves
@@ -15,9 +15,8 @@ const NOTES = [
 const NOTE_HEIGHT = 18;
 const BEAT_WIDTH = 80;
 
-export default function PianoRoll({ instruments }) {
-  const selectedClipId = useStore(state => state.selectedClipId);
-  const setSelectedClipId = useStore(state => state.setSelectedClipId);
+export default function PianoRoll({ clipId, instruments }) {
+  const clearSelection = useStore(state => state.clearSelection);
   const clips = useStore(state => state.clips);
   const tracks = useStore(state => state.tracks);
   const updateClipNotes = useStore(state => state.updateClipNotes);
@@ -25,14 +24,42 @@ export default function PianoRoll({ instruments }) {
 
   const [tool, setTool] = useState('draw');
   const [isVisible, setIsVisible] = useState(false); // For enter animation
+  const [isLocalPlaying, setIsLocalPlaying] = useState(false);
+  const [localPlayheadX, setLocalPlayheadX] = useState(0);
   const containerRef = useRef(null);
+  const keysRef = useRef(null);
 
-  const clip = clips.find(c => c.id === selectedClipId);
+  const clip = clips.find(c => c.id === clipId);
+  const snapPixels = gridSnap * BEAT_WIDTH;
 
   // 4.4: Entry animation
   useEffect(() => {
     requestAnimationFrame(() => setIsVisible(true));
+    return () => {
+      engine.stopIsolatedPlayback();
+    };
   }, []);
+
+  // 5.0: Isolated Playhead loop
+  useEffect(() => {
+    let frameId;
+    const update = () => {
+      if (isLocalPlaying) {
+        const globalPixels = engine.getPlayheadPosition(BEAT_WIDTH);
+        // Playhead is relative to clip
+        let relX = globalPixels - clip.x;
+        // Optional wrap if Tone handles loop (which it does)
+        if (relX > clip.width) relX = clip.width;
+        if (relX < 0) relX = 0;
+        setLocalPlayheadX(relX);
+        frameId = requestAnimationFrame(update);
+      }
+    };
+    if (isLocalPlaying) {
+      frameId = requestAnimationFrame(update);
+    }
+    return () => cancelAnimationFrame(frameId);
+  }, [isLocalPlaying, clip?.x, clip?.width]);
 
   if (!clip) return null;
 
@@ -51,7 +78,7 @@ export default function PianoRoll({ instruments }) {
     const x = e.clientX - rect.left + containerRef.current.scrollLeft;
     const y = e.clientY - rect.top + containerRef.current.scrollTop;
 
-    const snappedX = Math.round(x / gridSnap) * gridSnap;
+    const snappedX = Math.round(x / snapPixels) * snapPixels;
     const noteIdx = Math.floor(y / NOTE_HEIGHT);
 
     // 2.7: Restrict notes to clip width
@@ -59,12 +86,22 @@ export default function PianoRoll({ instruments }) {
 
     if (noteIdx >= 0 && noteIdx < NOTES.length) {
       const noteName = NOTES[noteIdx];
-      const noteDuration = Math.min(gridSnap * 2, clip.width - snappedX); // Don't exceed clip
+      const noteDuration = Math.min(snapPixels * 2, clip.width - snappedX); // Don't exceed clip
+      
+      // 2.2: Collision detection for drawing
+      const hasCollision = notes.some(n => 
+        n.note === noteName && 
+        snappedX < n.time + n.duration && 
+        snappedX + noteDuration > n.time
+      );
+      if (hasCollision) return;
+
       const newNote = {
         id: Date.now().toString(),
         note: noteName,
         time: snappedX,
-        duration: noteDuration
+        duration: noteDuration,
+        velocity: 0.8
       };
 
       engine.playNote(track?.inst || 'pad', noteName, "8n");
@@ -72,9 +109,29 @@ export default function PianoRoll({ instruments }) {
     }
   };
 
+  const handleTogglePlay = () => {
+    if (isLocalPlaying) {
+      engine.stopIsolatedPlayback();
+      setIsLocalPlaying(false);
+      setLocalPlayheadX(0);
+    } else {
+      engine.startIsolatedPlayback(clip.id, track.id);
+      setIsLocalPlaying(true);
+    }
+  };
+
   const handleClose = () => {
+    engine.stopIsolatedPlayback();
+    setIsLocalPlaying(false);
     setIsVisible(false);
-    setTimeout(() => setSelectedClipId(null), 200);
+    setTimeout(() => clearSelection(), 200);
+  };
+
+  // 1.2: Scroll sync
+  const handleGridScroll = () => {
+    if (containerRef.current && keysRef.current) {
+      keysRef.current.scrollTop = containerRef.current.scrollTop;
+    }
   };
 
   return (
@@ -99,6 +156,10 @@ export default function PianoRoll({ instruments }) {
           </div>
 
           <div className="flex gap-2">
+            <button onClick={handleTogglePlay} className={`btn-subnautica ${isLocalPlaying ? 'active' : ''}`} title="Isolate Playback (Local)">
+              {isLocalPlaying ? <Square size={14} /> : <Play size={14} />}
+            </button>
+            <div className="w-px bg-white/20 mx-2"></div>
             <button onClick={() => setTool('move')} className={`btn-subnautica ${tool === 'move' ? 'active' : ''}`} title="Move Tool"><MousePointer2 size={14} /></button>
             <button onClick={() => setTool('draw')} className={`btn-subnautica ${tool === 'draw' ? 'active' : ''}`} title="Draw Tool"><Pencil size={14} /></button>
             <button onClick={() => setTool('erase')} className={`btn-subnautica ${tool === 'erase' ? 'active' : ''}`} title="Erase Tool"><Scissors size={14} /></button>
@@ -114,17 +175,21 @@ export default function PianoRoll({ instruments }) {
         {/* Editor */}
         <div className="flex-1 flex overflow-hidden">
           {/* Piano Keys */}
-          <div className="w-14 flex flex-col shrink-0 border-r border-white/10 bg-black/40 overflow-y-auto overflow-x-hidden">
+          <div ref={keysRef} className="w-14 flex flex-col shrink-0 border-r border-white/10 bg-black/40 overflow-hidden pt-5">
             {NOTES.map((note) => {
               const isSharp = note.includes('#');
               const isC = note.startsWith('C') && !note.includes('#');
+              // 4.3: Alternating octave background
+              const octave = parseInt(note.slice(-1), 10);
+              const isEvenOctave = octave % 2 === 0;
+              
               return (
                 <div
                   key={note}
                   className={`flex items-center justify-end pr-1.5 border-b cursor-pointer transition-colors shrink-0 ${
                     isSharp ? 'bg-slate-900 text-white/30 border-white/5 hover:bg-emerald-500/20'
                     : isC ? 'bg-white/15 text-white/90 border-white/15 hover:bg-emerald-500/30'
-                    : 'bg-white/8 text-white/60 border-white/8 hover:bg-emerald-500/25'
+                    : `text-white/60 hover:bg-emerald-500/25 ${isEvenOctave ? 'bg-white/[0.04] border-white/5' : 'bg-white/8 border-white/8'}`
                   }`}
                   style={{ height: NOTE_HEIGHT, minHeight: NOTE_HEIGHT }}
                   onClick={() => engine.playNote(track?.inst || 'pad', note, "8n")}
@@ -143,8 +208,18 @@ export default function PianoRoll({ instruments }) {
             className="flex-1 overflow-auto relative bg-subnautica-deep"
             ref={containerRef}
             onMouseDown={handleContainerMouseDown}
+            onScroll={handleGridScroll}
             style={{ cursor: tool === 'draw' ? 'crosshair' : 'default' }}
           >
+            {/* 4.1: Mini-ruler (sticky top) */}
+            <div className="sticky top-0 z-10 h-5 bg-black/50 border-b border-white/10 flex overflow-hidden w-max">
+              {Array.from({ length: Math.ceil((clip.width + 40) / BEAT_WIDTH) }).map((_, i) => (
+                <div key={i} className="flex-shrink-0 text-[9px] text-white/40 font-mono flex items-center pl-1 border-l border-white/5" style={{ width: BEAT_WIDTH }}>
+                  {i + 1}
+                </div>
+              ))}
+            </div>
+
             {/* 2.7: Clip width boundary indicator */}
             <div style={{ width: clip.width + 40, height: NOTES.length * NOTE_HEIGHT, position: 'relative' }}>
               {/* Clip end boundary */}
@@ -171,13 +246,20 @@ export default function PianoRoll({ instruments }) {
               })}
 
               {/* Vertical grid */}
-              {Array.from({ length: Math.ceil((clip.width + 40) / gridSnap) }).map((_, i) => (
+              {Array.from({ length: Math.ceil((clip.width + 40) / snapPixels) }).map((_, i) => (
                 <div key={i} className="absolute top-0 bottom-0 pointer-events-none" style={{
-                  left: i * gridSnap,
+                  left: i * snapPixels,
                   width: '1px',
-                  background: (i * gridSnap) % BEAT_WIDTH === 0 ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.02)'
+                  background: (i * snapPixels) % BEAT_WIDTH === 0 ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.02)'
                 }} />
               ))}
+
+              {/* Local Playhead */}
+              {isLocalPlaying && (
+                <div className="absolute top-0 bottom-0 w-px bg-emerald-400 z-50 pointer-events-none" style={{ left: localPlayheadX, boxShadow: '0 0 10px rgba(52,211,153,0.5)' }}>
+                  <div className="absolute -top-2 -left-1.5 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[8px] border-t-emerald-400" />
+                </div>
+              )}
 
               {/* Notes */}
               {notes.map(noteObj => {
@@ -191,20 +273,50 @@ export default function PianoRoll({ instruments }) {
                     dragAxis="both"
                     disableDragging={tool !== 'move'}
                     enableResizing={{ right: tool === 'move', left: false, top: false, bottom: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
-                    dragGrid={[gridSnap, NOTE_HEIGHT]}
-                    resizeGrid={[gridSnap, 1]}
+                    dragGrid={[snapPixels, NOTE_HEIGHT]}
+                    resizeGrid={[snapPixels, 1]}
                     size={{ width: noteObj.duration, height: NOTE_HEIGHT - 2 }}
                     position={{ x: noteObj.time, y: noteIdx * NOTE_HEIGHT + 1 }}
                     onDragStop={(e, d) => {
                       let newNoteIdx = Math.round((d.y - 1) / NOTE_HEIGHT);
                       newNoteIdx = Math.max(0, Math.min(NOTES.length - 1, newNoteIdx));
-                      const updated = notes.map(n => n.id === noteObj.id ? { ...n, time: Math.max(0, d.x), note: NOTES[newNoteIdx] } : n);
-                      updateClipNotes(clip.id, updated);
-                      engine.playNote(track?.inst || 'pad', NOTES[newNoteIdx], "8n");
+                      const newTime = Math.max(0, d.x);
+                      const newNoteName = NOTES[newNoteIdx];
+                      
+                      // 2.2: Collision detection for drag
+                      const hasCollision = notes.some(n => 
+                        n.id !== noteObj.id &&
+                        n.note === newNoteName && 
+                        newTime < n.time + n.duration && 
+                        newTime + noteObj.duration > n.time
+                      );
+                      
+                      if (!hasCollision) {
+                        const updated = notes.map(n => n.id === noteObj.id ? { ...n, time: newTime, note: newNoteName } : n);
+                        updateClipNotes(clip.id, updated);
+                        engine.playNote(track?.inst || 'pad', newNoteName, "8n");
+                      }
                     }}
                     onResizeStop={(e, direction, ref) => {
-                      const updated = notes.map(n => n.id === noteObj.id ? { ...n, duration: parseInt(ref.style.width, 10) } : n);
-                      updateClipNotes(clip.id, updated);
+                      const newDuration = parseInt(ref.style.width, 10);
+                      
+                      // 2.2: Collision detection for resize
+                      const hasCollision = notes.some(n => 
+                        n.id !== noteObj.id &&
+                        n.note === noteObj.note && 
+                        noteObj.time < n.time + n.duration && 
+                        noteObj.time + newDuration > n.time
+                      );
+
+                      if (!hasCollision) {
+                        const updated = notes.map(n => n.id === noteObj.id ? { ...n, duration: newDuration } : n);
+                        updateClipNotes(clip.id, updated);
+                        // 2.3: Play sound on resize with duration mapped to Tone duration string approximately
+                        engine.playNote(track?.inst || 'pad', noteObj.note, "8n");
+                      } else {
+                        // Revert visually if collided (forces re-render with store state)
+                        updateClipNotes(clip.id, [...notes]);
+                      }
                     }}
                     style={{
                       background: instData?.color || '#34d399',
@@ -216,8 +328,20 @@ export default function PianoRoll({ instruments }) {
                       paddingLeft: '3px',
                       overflow: 'hidden',
                       transition: 'filter 0.1s',
+                      opacity: (noteObj.velocity !== undefined ? noteObj.velocity : 0.8) * 0.8 + 0.2 // 3.7: Velocity visual
                     }}
                     className="hover:brightness-125"
+                    onWheel={(e) => {
+                      if (e.shiftKey) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        const delta = e.deltaY > 0 ? -0.1 : 0.1;
+                        const newVel = Math.max(0.1, Math.min(1.0, (noteObj.velocity !== undefined ? noteObj.velocity : 0.8) + delta));
+                        const updated = notes.map(n => n.id === noteObj.id ? { ...n, velocity: newVel } : n);
+                        updateClipNotes(clip.id, updated);
+                        engine.playNote(track?.inst || 'pad', noteObj.note, "8n", newVel);
+                      }
+                    }}
                   >
                     <div
                       className="w-full h-full text-[7px] font-bold text-black/80 flex items-center leading-none"
@@ -225,6 +349,9 @@ export default function PianoRoll({ instruments }) {
                         if (tool === 'erase') {
                           e.stopPropagation();
                           updateClipNotes(clip.id, notes.filter(n => n.id !== noteObj.id));
+                        } else if (tool === 'move') {
+                          // 2.3: Auditioning existing notes
+                          engine.playNote(track?.inst || 'pad', noteObj.note, "8n");
                         }
                       }}
                     >

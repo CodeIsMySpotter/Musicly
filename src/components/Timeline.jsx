@@ -34,13 +34,14 @@ export default function Timeline({ instruments }) {
   const updateClip = useStore(state => state.updateClip);
   const removeClip = useStore(state => state.removeClip);
   const duplicateClip = useStore(state => state.duplicateClip);
-  const setSelectedClipId = useStore(state => state.setSelectedClipId);
-  const selectedClipId = useStore(state => state.selectedClipId);
+  const setSelectedClipIds = useStore(state => state.setSelectedClipIds);
+  const selectedClipIds = useStore(state => state.selectedClipIds);
+  const clearSelection = useStore(state => state.clearSelection);
   const activeTool = useStore(state => state.activeTool);
   const setActiveTool = useStore(state => state.setActiveTool);
   const bpm = useStore(state => state.bpm);
   const setBpm = useStore(state => state.setBpm);
-  const gridSnap = useStore(state => state.gridSnap);
+  const gridSnap = useStore(state => state.gridSnap); // Now a multiplier (e.g. 0.25)
   const setGridSnap = useStore(state => state.setGridSnap);
   const zoom = useStore(state => state.zoom);
   const setZoom = useStore(state => state.setZoom);
@@ -51,9 +52,38 @@ export default function Timeline({ instruments }) {
   const showContextMenu = useStore(state => state.showContextMenu);
   const contextMenu = useStore(state => state.contextMenu);
   const hideContextMenu = useStore(state => state.hideContextMenu);
+  const loopRegion = useStore(state => state.loopRegion);
+  const setLoopRegion = useStore(state => state.setLoopRegion);
 
   const beatWidth = BASE_BEAT_WIDTH * zoom;
-  const effectiveSnap = gridSnap * zoom;
+  const effectiveSnap = gridSnap * BASE_BEAT_WIDTH * zoom;
+
+  // 1.4: Sync bar ruler scroll
+  const barRulerRef = useRef(null);
+  const handleScroll = (e) => {
+    if (barRulerRef.current && timelineRef.current) {
+      barRulerRef.current.scrollLeft = timelineRef.current.scrollLeft;
+    }
+    // 4.6: Sync Y scroll with track headers
+    const headers = document.getElementById('track-headers-scroll');
+    if (headers && e.target && headers.scrollTop !== e.target.scrollTop) {
+      headers.scrollTop = e.target.scrollTop;
+    }
+  };
+
+  // 1.6: Context menu outside click
+  useEffect(() => {
+    const handleGlobalClick = (e) => {
+      if (contextMenu) {
+        hideContextMenu();
+      }
+    };
+    if (contextMenu) {
+      // Small timeout so the event that opened the menu doesn't immediately close it
+      setTimeout(() => window.addEventListener('click', handleGlobalClick), 0);
+    }
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, [contextMenu]);
 
   // 3.10: Time display
   const [timeDisplay, setTimeDisplay] = useState('001:01:000');
@@ -121,10 +151,15 @@ export default function Timeline({ instruments }) {
     setIsPlaying(true);
   }, []);
 
-  // Draw tool
+  // Draw tool & Selection clear
   const handleTimelineMouseDown = (e) => {
     // Close context menu on any click
     if (contextMenu) { hideContextMenu(); return; }
+
+    // Clear selection on empty space click
+    if (e.target.id === 'timeline-scroll' || e.target.id === 'timeline-bg') {
+      clearSelection();
+    }
 
     if (activeTool !== 'draw') return;
     const rect = timelineRef.current.getBoundingClientRect();
@@ -135,10 +170,17 @@ export default function Timeline({ instruments }) {
     trackIdx = Math.max(0, Math.min(tracks.length - 1, trackIdx));
 
     if (tracks[trackIdx]) {
+      const trackId = tracks[trackIdx].id;
+      const width = beatWidth * 2;
+      
+      // 2.1: Collision detection for drawing
+      const hasCollision = clips.some(c => c.trackId === trackId && c.x < snappedX + width && c.x + c.width > snappedX);
+      if (hasCollision) return;
+
       addClip({
-        trackId: tracks[trackIdx].id,
+        trackId,
         x: snappedX,
-        width: beatWidth * 2,
+        width,
         notes: [{ id: Date.now().toString(), note: 'C3', time: 0, duration: beatWidth * 2 }]
       });
     }
@@ -178,88 +220,96 @@ export default function Timeline({ instruments }) {
   // 2.3: Bar numbers
   const totalBars = Math.ceil(3000 / (beatWidth * 4));
 
-  // 3.2: Snap options
+  // 3.2: Snap options (multipliers of BEAT_WIDTH)
   const snapOptions = [
-    { label: '1/4', value: beatWidth / 4 },
-    { label: '1/8', value: beatWidth / 8 },
-    { label: '1/16', value: beatWidth / 16 },
-    { label: '1/32', value: beatWidth / 32 },
-    { label: 'Off', value: 1 },
+    { label: '1/4', value: 0.25 },
+    { label: '1/8', value: 0.125 },
+    { label: '1/16', value: 0.0625 },
+    { label: '1/32', value: 0.03125 },
+    { label: 'Off', value: 1 / BASE_BEAT_WIDTH }, // ~1px snap
   ];
 
   return (
     <div className="flex-1 flex flex-col bg-subnautica-deep/80 relative">
       {/* Toolbar */}
-      <div className="h-10 border-b border-subnautica-border glass-panel flex items-center px-4 gap-4 sticky top-0 z-30 shadow-lg shrink-0">
-        {/* Transport */}
-        <div className="flex items-center gap-1.5">
-          <button onClick={handleReplay} className="btn-subnautica !px-2 !py-1" title="Go to start (Home)">
-            <FastForward size={13} className="rotate-180" />
-          </button>
-          <button onClick={handlePlayToggle} className={`btn-subnautica !px-2 !py-1 ${isPlaying ? 'active' : ''}`} title="Play/Pause (Space)">
-            {isPlaying ? <Square size={13} /> : <Play size={13} />}
-          </button>
-        </div>
-
-        {/* 3.10: Time Display */}
-        <span className="font-mono text-xs text-emerald-400 bg-black/30 px-2 py-0.5 rounded tracking-wider min-w-[90px] text-center">
-          {timeDisplay}
-        </span>
-
-        {/* BPM */}
-        <div className="flex items-center gap-1 text-xs">
-          <span className="text-subnautica-active text-[10px]">BPM</span>
-          <input
-            type="number" value={bpm}
-            onChange={(e) => setBpm(Math.max(20, Math.min(300, Number(e.target.value))))}
-            className="w-12 bg-white/5 border border-white/10 rounded px-1 py-0.5 text-center text-white outline-none text-[11px]"
-          />
-        </div>
-
-        {/* 3.2: Grid Snap */}
-        <div className="flex items-center gap-1 text-xs">
-          <span className="text-white/50 text-[10px]">Snap</span>
-          <select
-            value={gridSnap}
-            onChange={(e) => setGridSnap(Number(e.target.value))}
-            className="bg-white/5 border border-white/10 rounded px-1 py-0.5 text-white outline-none text-[10px] cursor-pointer"
+      <div className="h-12 border-b border-subnautica-border glass-panel flex items-center px-4 gap-6 sticky top-0 z-30 shadow-lg shrink-0">
+        
+        {/* TRANSPORT GROUP */}
+        <div className="flex items-center gap-3">
+          <span className="text-[9px] font-bold text-white/30 tracking-wider absolute top-1">TRANSPORT</span>
+          <div className="flex items-center gap-1.5 mt-2">
+            <button onClick={handleReplay} className="btn-subnautica !px-2 !py-1" title="Go to start (Home)">
+              <FastForward size={13} className="rotate-180" />
+            </button>
+            <button onClick={handlePlayToggle} className={`btn-subnautica !px-2 !py-1 ${isPlaying ? 'active' : ''}`} title="Play/Pause (Space)">
+              {isPlaying ? <Square size={13} /> : <Play size={13} />}
+            </button>
+          </div>
+          <span className="font-mono text-xs text-emerald-400 bg-black/30 px-2 py-0.5 rounded tracking-wider min-w-[90px] text-center mt-2">
+            {timeDisplay}
+          </span>
+          <div className="flex items-center gap-1 text-xs mt-2">
+            <span className="text-subnautica-active text-[10px]">BPM</span>
+            <input
+              type="number" value={bpm}
+              onChange={(e) => setBpm(Math.max(20, Math.min(300, Number(e.target.value))))}
+              className="w-12 bg-white/5 border border-white/10 rounded px-1 py-0.5 text-center text-white outline-none text-[11px]"
+            />
+          </div>
+          <button
+            onClick={() => setMetronomeEnabled(!metronomeEnabled)}
+            className={`btn-subnautica !p-1.5 mt-2 ${metronomeEnabled ? 'active' : ''}`}
+            title="Metronome"
           >
-            {snapOptions.map(opt => (
-              <option key={opt.label} value={opt.value} className="bg-subnautica-deep">{opt.label}</option>
-            ))}
-          </select>
+            🔔
+          </button>
         </div>
 
-        <div className="w-px h-5 bg-white/10" />
+        <div className="w-px h-6 bg-white/10" />
 
-        {/* Tools */}
-        <div className="flex items-center gap-1">
-          <button onClick={() => setActiveTool('move')} className={`btn-subnautica !p-1.5 ${activeTool === 'move' ? 'active' : ''}`} title="Move Tool (V)"><MousePointer2 size={13} /></button>
-          <button onClick={() => setActiveTool('draw')} className={`btn-subnautica !p-1.5 ${activeTool === 'draw' ? 'active' : ''}`} title="Draw Tool (D)"><Pencil size={13} /></button>
-          <button onClick={() => setActiveTool('erase')} className={`btn-subnautica !p-1.5 ${activeTool === 'erase' ? 'active' : ''}`} title="Erase Tool (E)"><Scissors size={13} /></button>
+        {/* GRID GROUP */}
+        <div className="flex items-center gap-3 relative">
+          <span className="text-[9px] font-bold text-white/30 tracking-wider absolute top-1 -mt-3">GRID & VIEW</span>
+          
+          <div className="flex items-center gap-1 text-xs mt-2">
+            <span className="text-white/50 text-[10px]">Snap</span>
+            <select
+              value={gridSnap}
+              onChange={(e) => setGridSnap(Number(e.target.value))}
+              className="bg-white/5 border border-white/10 rounded px-1 py-0.5 text-white outline-none text-[10px] cursor-pointer"
+            >
+              {snapOptions.map(opt => (
+                <option key={opt.label} value={opt.value} className="bg-subnautica-deep">{opt.label}</option>
+              ))}
+            </select>
+          </div>
+          
+          <div className="flex items-center gap-1 mt-2">
+            <button onClick={() => setZoom(zoom - 0.25)} className="btn-subnautica !p-1.5" title="Zoom Out"><ZoomOut size={13} /></button>
+            <span className="text-[10px] text-white/60 w-8 text-center">{Math.round(zoom * 100)}%</span>
+            <button onClick={() => setZoom(zoom + 0.25)} className="btn-subnautica !p-1.5" title="Zoom In"><ZoomIn size={13} /></button>
+          </div>
         </div>
 
-        <div className="w-px h-5 bg-white/10" />
+        <div className="w-px h-6 bg-white/10" />
 
-        {/* 3.1: Zoom */}
-        <div className="flex items-center gap-1">
-          <button onClick={() => setZoom(zoom - 0.25)} className="btn-subnautica !p-1.5" title="Zoom Out"><ZoomOut size={13} /></button>
-          <span className="text-[10px] text-white/60 w-8 text-center">{Math.round(zoom * 100)}%</span>
-          <button onClick={() => setZoom(zoom + 0.25)} className="btn-subnautica !p-1.5" title="Zoom In"><ZoomIn size={13} /></button>
+        {/* TOOLS GROUP */}
+        <div className="flex items-center gap-1 relative">
+          <span className="text-[9px] font-bold text-white/30 tracking-wider absolute top-1 -mt-3">TOOLS</span>
+          <div className="flex items-center gap-1 mt-2">
+            <button onClick={() => setActiveTool('move')} className={`btn-subnautica !p-1.5 ${activeTool === 'move' ? 'active' : ''}`} title="Move Tool (V)"><MousePointer2 size={13} /></button>
+            <button onClick={() => setActiveTool('draw')} className={`btn-subnautica !p-1.5 ${activeTool === 'draw' ? 'active' : ''}`} title="Draw Tool (D)"><Pencil size={13} /></button>
+            <button onClick={() => setActiveTool('erase')} className={`btn-subnautica !p-1.5 ${activeTool === 'erase' ? 'active' : ''}`} title="Erase Tool (E)"><Scissors size={13} /></button>
+          </div>
         </div>
-
-        {/* 3.4: Metronome toggle */}
-        <button
-          onClick={() => setMetronomeEnabled(!metronomeEnabled)}
-          className={`btn-subnautica !p-1.5 ${metronomeEnabled ? 'active' : ''}`}
-          title="Metronome"
-        >
-          🔔
-        </button>
       </div>
 
       {/* 2.3: Bar numbers ruler */}
-      <div className="h-5 bg-black/30 border-b border-white/5 flex items-center overflow-hidden shrink-0 relative" style={{ paddingLeft: '10px' }}>
+      <div 
+        ref={barRulerRef}
+        className="h-5 bg-black/30 border-b border-white/5 flex items-center overflow-hidden shrink-0 relative" 
+        style={{ paddingLeft: '10px' }}
+      >
         <div style={{ width: `${totalBars * beatWidth * 4}px`, position: 'relative', height: '100%' }}>
           {Array.from({ length: totalBars }).map((_, i) => (
             <span
@@ -270,17 +320,49 @@ export default function Timeline({ instruments }) {
               {i + 1}
             </span>
           ))}
+
+          {/* 3.1: Loop Region */}
+          {loopRegion && (
+            <Rnd
+              bounds="parent"
+              dragAxis="x"
+              enableResizing={{ right: true, left: true, top: false, bottom: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
+              dragGrid={[effectiveSnap, 1]}
+              resizeGrid={[effectiveSnap, 1]}
+              size={{ width: (loopRegion.end - loopRegion.start) * beatWidth, height: 20 }}
+              position={{ x: loopRegion.start * beatWidth, y: 0 }}
+              onDragStop={(e, d) => {
+                const newStart = Math.max(0, d.x / beatWidth);
+                setLoopRegion(newStart, newStart + (loopRegion.end - loopRegion.start));
+              }}
+              onResizeStop={(e, dir, ref, delta, position) => {
+                const newStart = Math.max(0, position.x / beatWidth);
+                const newWidth = Math.max(0.25, parseInt(ref.style.width, 10) / beatWidth);
+                setLoopRegion(newStart, newStart + newWidth);
+              }}
+              style={{
+                background: 'rgba(56, 189, 248, 0.1)',
+                borderLeft: '2px solid rgba(56, 189, 248, 0.8)',
+                borderRight: '2px solid rgba(56, 189, 248, 0.8)',
+                cursor: 'grab',
+                zIndex: 10
+              }}
+            />
+          )}
         </div>
       </div>
 
       {/* Grid area */}
       <div
+        id="timeline-scroll"
         ref={timelineRef}
         className="flex-1 relative overflow-auto"
         style={{ padding: '0 10px' }}
+        onScroll={handleScroll}
       >
         <div
           onMouseDown={handleTimelineMouseDown}
+          id="timeline-bg"
           style={{
             position: 'relative',
             width: `${totalBars * beatWidth * 4}px`,
@@ -307,6 +389,14 @@ export default function Timeline({ instruments }) {
             </div>
           ))}
 
+          {/* 4.4: Empty state */}
+          {clips.length === 0 && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center text-white/30 pointer-events-none z-10" style={{ height: '50vh' }}>
+              <Pencil size={48} className="mb-4 opacity-50 text-subnautica-active" />
+              <p className="text-sm font-semibold tracking-wider">Draw clips on the timeline or press D to switch to Draw mode</p>
+            </div>
+          )}
+
           {/* 4.3: Playhead with glow animation */}
           <div
             onMouseDown={handlePlayheadMouseDown}
@@ -332,7 +422,7 @@ export default function Timeline({ instruments }) {
             if (trackIndex === -1) return null;
             const clipColor = getTrackColor(clip.trackId);
             const clipInstName = getTrackInstName(clip.trackId);
-            const isSelected = clip.id === selectedClipId;
+            const isSelected = selectedClipIds.includes(clip.id);
 
             return (
               <Rnd
@@ -348,10 +438,37 @@ export default function Timeline({ instruments }) {
                 onDragStop={(e, d) => {
                   let newTrackIdx = Math.round(d.y / TRACK_STEP_Y);
                   newTrackIdx = Math.max(0, Math.min(tracks.length - 1, newTrackIdx));
-                  updateClip(clip.id, { x: Math.round(d.x / zoom), trackId: tracks[newTrackIdx].id });
+                  const newTrackId = tracks[newTrackIdx].id;
+                  const newX = Math.round(d.x / zoom);
+                  
+                  // 3.3: Duplicate with Alt+Drag
+                  if (e.altKey) {
+                    const hasCollision = clips.some(c => c.trackId === newTrackId && c.x < newX + clip.width && c.x + c.width > newX);
+                    if (!hasCollision) {
+                       addClip({ ...clip, trackId: newTrackId, x: newX, notes: clip.notes.map(n => ({...n, id: Date.now()+Math.random()})) });
+                    }
+                    updateClip(clip.id, { _force: Date.now() }); // Snap original back
+                    return;
+                  }
+
+                  // 2.1: Collision detection
+                  const hasCollision = clips.some(c => c.id !== clip.id && c.trackId === newTrackId && c.x < newX + clip.width && c.x + c.width > newX);
+                  if (!hasCollision) {
+                    updateClip(clip.id, { x: newX, trackId: newTrackId });
+                  } else {
+                    updateClip(clip.id, { _force: Date.now() }); // Force render to snap back
+                  }
                 }}
                 onResizeStop={(e, direction, ref) => {
-                  updateClip(clip.id, { width: Math.round(parseInt(ref.style.width, 10) / zoom) });
+                  const newWidth = Math.round(parseInt(ref.style.width, 10) / zoom);
+                  
+                  // 2.1: Collision detection
+                  const hasCollision = clips.some(c => c.id !== clip.id && c.trackId === clip.trackId && c.x < clip.x + newWidth && c.x + c.width > clip.x);
+                  if (!hasCollision) {
+                    updateClip(clip.id, { width: newWidth });
+                  } else {
+                    updateClip(clip.id, { _force: Date.now() }); // Force render to snap back
+                  }
                 }}
                 style={{
                   background: `linear-gradient(90deg, ${clipColor}40 0%, ${clipColor}15 100%)`,
@@ -364,8 +481,8 @@ export default function Timeline({ instruments }) {
                 }}
               >
                 <div
-                  onClick={() => { if (activeTool === 'move') setSelectedClipId(clip.id); }}
-                  onDoubleClick={() => setSelectedClipId(clip.id)}
+                  onClick={(e) => { if (activeTool === 'move') setSelectedClipIds(clip.id, e.ctrlKey || e.metaKey); }}
+                  onDoubleClick={() => setSelectedClipIds(clip.id)}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     showContextMenu(e.clientX, e.clientY, clip.id);
@@ -415,7 +532,7 @@ export default function Timeline({ instruments }) {
           className="fixed z-[200] bg-subnautica-panel border border-subnautica-border rounded-lg shadow-xl py-1 min-w-[160px] backdrop-blur-md"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
-          <button className="w-full text-left px-3 py-1.5 text-xs text-white/80 hover:bg-white/10 transition-colors" onClick={() => { setSelectedClipId(contextMenu.clipId); hideContextMenu(); }}>
+          <button className="w-full text-left px-3 py-1.5 text-xs text-white/80 hover:bg-white/10 transition-colors" onClick={() => { setSelectedClipIds(contextMenu.clipId); hideContextMenu(); }}>
             🎹 Edit (Piano Roll)
           </button>
           <button className="w-full text-left px-3 py-1.5 text-xs text-white/80 hover:bg-white/10 transition-colors" onClick={() => { duplicateClip(contextMenu.clipId); hideContextMenu(); }}>
