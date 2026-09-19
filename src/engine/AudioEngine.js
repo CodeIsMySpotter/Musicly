@@ -453,7 +453,7 @@ class AudioEngine {
     // Lazy-create preview synths so they don't interfere with track synths
     if (!this.previewSynths[instrument]) {
       this.previewSynths[instrument] = createSynth(instrument);
-      this.previewSynths[instrument].connect(this.effects.masterFilter);
+      this.previewSynths[instrument].toDestination();
     }
     const synth = this.previewSynths[instrument];
     try {
